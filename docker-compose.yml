@@ -1,0 +1,15 @@
+version: '3'
+services:
+  nginx-nsalinas:
+    build: ./nginx
+    links:
+      - app-nsalinas
+    ports:
+    - "3000:80"
+
+  app-nsalinas:
+    build: ./app
+    expose:
+      - "3000"
+    environment:
+      - NAME=nsalinas

@@ -1,0 +1,245 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: network pre requisites
+
+
+# Input Paramters
+Parameters:
+  StackName: 
+    Type: String
+    Default: Fargate-Network-Stack
+    Description: The name of the parent fargate networking stack
+  ServiceName:
+    Type: String
+    Default: nginx
+    Description: Name of the ECS service
+  ImageUrl:
+    Type: String
+    Default: nginx
+    Description: The url of a docker image that contains the application process that
+                 will handle the traffic for this service
+  ContainerPort:
+    Type: Number
+    Default: 80
+    Description: What port number the application inside the docker container is binding to
+  ContainerCpu:
+    Type: Number
+    Default: 256
+    Description: How much CPU to give the container. 1024 is 1 CPU
+  ContainerMemory:
+    Type: Number
+    Default: 512
+    Description: How much memory in megabytes to give the container
+  Path:
+    Type: String
+    Default: "*"
+    Description: A path on the public load balancer that this service
+                 should be connected to. Use * to send all load balancer
+                 traffic to this service.
+  Priority:
+    Type: Number
+    Default: 1
+    Description: The priority for the routing rule added to the load balancer.
+                 This only applies if your have multiple services which have been
+                 assigned to different paths on the load balancer.
+  DesiredCount:
+    Type: Number
+    Default: 2
+    Description: How many copies of the service task to run
+  Role:
+    Type: String
+    Default: ""
+    Description: (Optional) An IAM role to give the service's containers if the code within needs to
+                 access other AWS resources like S3 buckets, DynamoDB tables, etc
+
+Conditions: 
+  HasCustomRole: !Not [!Equals [!Ref 'Role', '']]   
+
+
+Resources:
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+
+# ECS Roles    
+# This role is used by the ECS tasks themselves.
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                # Allow the ECS Tasks to download images from ECR
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+
+                # Allow the ECS tasks to upload logs to CloudWatch
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+              Resource: '*'    
+
+  # This is an IAM role which authorizes ECS to manage resources on our
+  # account on our behalf, such as updating our load balancer with the
+  # details of where our containers are, so that traffic can reach your
+  # containers.
+  ECSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              # Rules which allow ECS to attach network interfaces to instances
+              # on our behalf in order for awsvpc networking mode to work right
+              - 'ec2:AttachNetworkInterface'
+              - 'ec2:CreateNetworkInterface'
+              - 'ec2:CreateNetworkInterfacePermission'
+              - 'ec2:DeleteNetworkInterface'
+              - 'ec2:DeleteNetworkInterfacePermission'
+              - 'ec2:Describe*'
+              - 'ec2:DetachNetworkInterface'
+
+              # Rules which allow ECS to update load balancers on our behalf
+              # with the information about how to send traffic to our containers
+              - 'elasticloadbalancing:DeregisterInstancesFromLoadBalancer'
+              - 'elasticloadbalancing:DeregisterTargets'
+              - 'elasticloadbalancing:Describe*'
+              - 'elasticloadbalancing:RegisterInstancesWithLoadBalancer'
+              - 'elasticloadbalancing:RegisterTargets'
+            Resource: '*'
+
+  # Load Balancer
+  PublicLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer 
+    Properties:
+      Scheme: internet-facing 
+      LoadBalancerAttributes: 
+        - Key: idle_timeout.timeout_seconds
+          Value: '30'
+      Subnets: 
+        - !ImportValue  PublicSubnetId 
+        - !ImportValue PublicSubnetId2 
+      SecurityGroups: [!ImportValue  'WebServerGroupId']
+
+  # Target Group
+  DummyTargetGroupPublic:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Name: !Join ['-', [!Ref 'AWS::StackName', 'drop-1']]
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !ImportValue "VpcId"
+
+  # Listener
+  PublicLoadBalancerListener: 
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'DummyTargetGroupPublic'
+          Type: 'forward'
+      LoadBalancerArn: !Ref 'PublicLoadBalancer'      
+      Port: 80
+      Protocol: HTTP   
+      
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition 
+    Properties: 
+      Family: !Ref 'ServiceName'
+      Cpu: !Ref 'ContainerCpu'
+      Memory: !Ref 'ContainerMemory'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: 
+        - FARGATE 
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn 
+      TaskRoleArn:
+        Fn::If: 
+          - 'HasCustomRole' 
+          - !Ref 'Role'
+          - !Ref "AWS::NoValue"         
+      ContainerDefinitions:
+        - Name: !Ref 'ServiceName'
+          Cpu: !Ref 'ContainerCpu'
+          Memory: !Ref 'ContainerMemory'
+          Image: !Ref 'ImageUrl'
+          PortMappings: 
+            - ContainerPort: !Ref 'ContainerPort'      
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup 
+    Properties: 
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP 
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      TargetType: ip 
+      Name: !Ref 'ServiceName'
+      Port: !Ref 'ContainerPort'
+      Protocol: HTTP 
+      UnhealthyThresholdCount: 2
+      VpcId: !ImportValue "VpcId"
+
+  LoadBalancerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref 'TargetGroup'       
+          Type: 'forward'
+      Conditions:
+        - Field: path-pattern
+          Values: [!Ref 'Path']       
+      ListenerArn: !Ref PublicLoadBalancerListener
+      Priority: !Ref 'Priority'  
+
+  # ECS or Fargate Service     
+  Service: 
+    Type: AWS::ECS::Service 
+    DependsOn: LoadBalancerRule 
+    Properties: 
+      ServiceName: !Ref 'ServiceName'
+      Cluster: !Ref 'ECSCluster'
+      LaunchType: FARGATE 
+      DeploymentConfiguration: 
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      DesiredCount: !Ref 'DesiredCount'    
+      NetworkConfiguration: 
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: 
+            - !ImportValue "WebServerGroupId"
+          Subnets:
+            - !ImportValue  "PublicSubnetId" 
+            - !ImportValue "PublicSubnetId2"
+      TaskDefinition: !Ref TaskDefinition
+      LoadBalancers:
+        - ContainerName: !Ref 'ServiceName'
+          ContainerPort: !Ref 'ContainerPort'
+          TargetGroupArn: !Ref 'TargetGroup' 
